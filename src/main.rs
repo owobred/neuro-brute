@@ -1,19 +1,23 @@
 #![feature(slice_as_chunks, iter_array_chunks, file_create_new)]
 
 use std::{
+    io::Write,
     ops::Range,
-    sync::{atomic::{AtomicU64, AtomicBool}, mpsc, Arc}, io::Write,
+    sync::{
+        atomic::{AtomicBool, AtomicU64},
+        mpsc, Arc,
+    },
 };
 
-use aes::cipher::{generic_array::GenericArray, BlockDecryptMut, KeyInit, BlockDecrypt};
+use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockDecryptMut, KeyInit};
 use base64::Engine;
+use num_format::{Locale, ToFormattedString};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
-use num_format::{ToFormattedString, Locale};
 
 const THREAD_COUNT: usize = 16;
-const FEEDBACK_CHUNK_SIZE: usize = 100_000;
+const FEEDBACK_CHUNK_SIZE: usize = 250_000;
 const FEEDBACK_WAIT_MS: u64 = 10000;
 
 #[derive(Debug, Error)]
@@ -90,12 +94,15 @@ fn main() {
         let counter = counter.clone();
         let feedback_send = feedback_send.clone();
 
-        let handle = std::thread::spawn(move || {
-            handle_aes_crack(thread_to_crack, thread_range, counter, feedback_send);
-        });
+        let handle = std::thread::Builder::new()
+            .name("crack thread".to_string())
+            .stack_size(100 * 1024 * 1024)
+            .spawn(move || {
+                handle_aes_crack(thread_to_crack, thread_range, counter, feedback_send);
+            }).expect("thread spawn failed");
         crack_threads.push(handle);
     }
-    drop(feedback_send);  // drop the extra sender
+    drop(feedback_send); // drop the extra sender
 
     let rate_should_exit = completed.clone();
     let rate_thread = std::thread::spawn(move || {
@@ -119,6 +126,10 @@ fn main() {
 
             last_count = new_count;
 
+            if new_count > 500_000_000 {
+                std::process::exit(0);
+            }
+
             if rate_should_exit.load(std::sync::atomic::Ordering::Relaxed) {
                 warn!("rate thread exiting due to feedback thread exiting");
                 break;
@@ -129,11 +140,13 @@ fn main() {
     });
 
     let feedback_thread = std::thread::spawn(move || {
-        let mut file = std::fs::File::create_new("./crack_keys.txt").expect("crack_keys.txt already exists");
+        let mut file =
+            std::fs::File::create("./crack_keys.txt").expect("failed to create crack_keys.txt");
         for feedback in feedback_rcv {
             info!("got feedback: {:?}", feedback);
             let to_write = format!("{:?}\n", feedback);
-            file.write(to_write.as_bytes()).expect("failed to write key to file");
+            file.write(to_write.as_bytes())
+                .expect("failed to write key to file");
             file.flush().expect("failed to flush file");
         }
         completed.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -183,16 +196,41 @@ fn do_aes_range(
     to_crack: Vec<GenericArray16>,
     feedback_send: mpsc::Sender<FeedbackData>,
 ) {
+    let mut key_buffer = "1700000000000024".to_string();
     for value in range {
         let to_crack = to_crack.clone();
-        let result = do_aes_crack(to_crack, value);
+        let result = {
+            let mut to_crack = to_crack;
+            let inner = value.to_string();
+            let rang = (2 + (12 - inner.len()))..(14);
+            key_buffer.replace_range(rang, &inner);
+            assert_eq!(key_buffer.len(), 16, "key was not 16 bytes long");
+
+            let cipher = aes::Aes128::new_from_slice(key_buffer.as_bytes()).expect("cipher failed");
+
+            let chunks = to_crack.as_mut_slice();
+            cipher.decrypt_blocks(chunks);
+
+            if let Ok(utf8) = simdutf8::basic::from_utf8(
+                &chunks.into_iter().flatten().map(|v| *v).collect::<Vec<_>>(),
+            ) {
+                Ok(utf8.to_owned())
+            } else {
+                Err(AesCrackError::NotUtf8)
+            }
+        };
 
         match result {
             Ok(string) => {
-                feedback_send.send(FeedbackData { key: get_key_from_value(value), data: string.clone() }).expect(&format!(
-                    "failed to send message back. message was {}",
-                    string
-                ));
+                feedback_send
+                    .send(FeedbackData {
+                        key: get_key_from_value_slow(value),
+                        data: string.clone(),
+                    })
+                    .expect(&format!(
+                        "failed to send message back. message was {}",
+                        string
+                    ));
             }
             Err(error) => match error {
                 AesCrackError::DecryptionError => warn!("Decryption error for value {}", value),
@@ -202,25 +240,25 @@ fn do_aes_range(
     }
 }
 
-fn get_key_from_value(value: u64) -> String {
+fn get_key_from_value_slow(value: u64) -> String {
     format!("17{:0>12}24", value)
 }
 
-fn do_aes_crack(mut to_crack: Vec<GenericArray16>, value: u64) -> Result<String, AesCrackError> {
-    let key = get_key_from_value(value);
-    assert_eq!(key.len(), 16, "key was not 16 bytes long");
+// fn do_aes_crack(mut to_crack: Vec<GenericArray16>, value: u64) -> Result<String, AesCrackError> {
+//     let key = get_key_from_value(value);
+//     assert_eq!(key.len(), 16, "key was not 16 bytes long");
 
-    let cipher =
-        aes::Aes128::new_from_slice(key.as_bytes()).map_err(|_| AesCrackError::DecryptionError)?;
+//     let cipher =
+//         aes::Aes128::new_from_slice(key.as_bytes()).map_err(|_| AesCrackError::DecryptionError)?;
 
-    let chunks = to_crack.as_mut_slice();
-    cipher.decrypt_blocks(chunks);
+//     let chunks = to_crack.as_mut_slice();
+//     cipher.decrypt_blocks(chunks);
 
-    if let Ok(utf8) =
-        simdutf8::basic::from_utf8(&chunks.into_iter().flatten().map(|v| *v).collect::<Vec<_>>())
-    {
-        Ok(utf8.to_owned())
-    } else {
-        Err(AesCrackError::NotUtf8)
-    }
-}
+//     if let Ok(utf8) =
+//         simdutf8::basic::from_utf8(&chunks.into_iter().flatten().map(|v| *v).collect::<Vec<_>>())
+//     {
+//         Ok(utf8.to_owned())
+//     } else {
+//         Err(AesCrackError::NotUtf8)
+//     }
+// }
