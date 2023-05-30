@@ -198,7 +198,7 @@ fn do_aes_range(
     feedback_send: mpsc::Sender<FeedbackData>,
 ) {
     let mut key_buffer = [0x31, 0x37, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x32, 0x34];
-    let mut inner_buffer = [0u8; 12];
+    let mut inner_buffer = [0x30u8; 12];
     for value in range {
         let to_crack = to_crack.clone();
         let result: Result<Vec<u8>, AesCrackError> = {
