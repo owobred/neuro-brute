@@ -12,20 +12,21 @@ use std::{
 use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockDecryptMut, KeyInit};
 use base64::Engine;
 use num_format::{Locale, ToFormattedString};
+use numtoa::NumToA;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 
 const THREAD_COUNT: usize = 16;
-const FEEDBACK_CHUNK_SIZE: usize = 250_000;
+const FEEDBACK_CHUNK_SIZE: usize = 5_000_000;
 const FEEDBACK_WAIT_MS: u64 = 10000;
 
 #[derive(Debug, Error)]
 enum AesCrackError {
     #[error("failed to decrypt data")]
     DecryptionError,
-    #[error("decrypted data was not utf-8")]
-    NotUtf8,
+    #[error("decrypted data had no png header")]
+    NotPng,
 }
 
 type GenericArray16 = GenericArray<u8, aes::cipher::typenum::U16>;
@@ -33,7 +34,7 @@ type GenericArray16 = GenericArray<u8, aes::cipher::typenum::U16>;
 #[derive(Debug)]
 struct FeedbackData {
     key: String,
-    data: String,
+    data: Vec<u8>,
 }
 
 fn main() {
@@ -96,7 +97,7 @@ fn main() {
 
         let handle = std::thread::Builder::new()
             .name("crack thread".to_string())
-            .stack_size(100 * 1024 * 1024)
+            .stack_size(1024 * 1024 * 1024)
             .spawn(move || {
                 handle_aes_crack(thread_to_crack, thread_range, counter, feedback_send);
             }).expect("thread spawn failed");
@@ -126,7 +127,7 @@ fn main() {
 
             last_count = new_count;
 
-            if new_count > 500_000_000 {
+            if new_count > 5_000_000_000 {
                 std::process::exit(0);
             }
 
@@ -196,27 +197,28 @@ fn do_aes_range(
     to_crack: Vec<GenericArray16>,
     feedback_send: mpsc::Sender<FeedbackData>,
 ) {
-    let mut key_buffer = "1700000000000024".to_string();
+    let mut key_buffer = [0x31, 0x37, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x32, 0x34];
+    let mut inner_buffer = [0u8; 12];
     for value in range {
         let to_crack = to_crack.clone();
-        let result = {
+        let result: Result<Vec<u8>, AesCrackError> = {
             let mut to_crack = to_crack;
-            let inner = value.to_string();
-            let rang = (2 + (12 - inner.len()))..(14);
-            key_buffer.replace_range(rang, &inner);
+            let _ = value.numtoa(10, &mut inner_buffer);
+            // let rang = (2 + (12 - inner_buffer.len()))..(14);
+            let rang = 2..14;
+            // key_buffer.replace_range(rang, inner);
+            key_buffer[rang].swap_with_slice(&mut inner_buffer);
             assert_eq!(key_buffer.len(), 16, "key was not 16 bytes long");
 
-            let cipher = aes::Aes128::new_from_slice(key_buffer.as_bytes()).expect("cipher failed");
+            let cipher = aes::Aes128::new_from_slice(&mut key_buffer).expect("cipher failed");
 
             let chunks = to_crack.as_mut_slice();
             cipher.decrypt_blocks(chunks);
 
-            if let Ok(utf8) = simdutf8::basic::from_utf8(
-                &chunks.into_iter().flatten().map(|v| *v).collect::<Vec<_>>(),
-            ) {
-                Ok(utf8.to_owned())
+            if chunks[0][..=3] == [0x89, 0x50, 0x4E] {
+                Ok(chunks.into_iter().flatten().map(|v| *v).collect::<Vec<_>>())
             } else {
-                Err(AesCrackError::NotUtf8)
+                Err(AesCrackError::NotPng)
             }
         };
 
@@ -228,13 +230,13 @@ fn do_aes_range(
                         data: string.clone(),
                     })
                     .expect(&format!(
-                        "failed to send message back. message was {}",
+                        "failed to send message back. message was {:x?}",
                         string
                     ));
             }
             Err(error) => match error {
                 AesCrackError::DecryptionError => warn!("Decryption error for value {}", value),
-                AesCrackError::NotUtf8 => (),
+                AesCrackError::NotPng => (),
             },
         };
     }
