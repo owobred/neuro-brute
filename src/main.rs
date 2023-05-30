@@ -97,16 +97,17 @@ fn main() {
 
     let mut crack_threads = vec![];
 
-    for thread_range in thread_ranges {
+    for (thread_id, thread_range) in thread_ranges.into_iter().enumerate() {
         let thread_to_crack = chunks.clone();
         let counter = counter.clone();
         let feedback_send = feedback_send.clone();
 
         let handle = std::thread::Builder::new()
-            .name("crack thread".to_string())
-            // .stack_size(1024 * 1024 * 1024)
+            .name(format!("crack thread {}", thread_id))
             .spawn(move || {
+                debug!("starting crack thread {}", thread_id);
                 handle_aes_crack(thread_to_crack, thread_range, counter, feedback_send);
+                debug!("crack thread {} completed", thread_id);
             }).expect("thread spawn failed");
         crack_threads.push(handle);
     }
@@ -176,9 +177,6 @@ fn handle_aes_crack(
     feedback_send: mpsc::Sender<FeedbackData>,
 ) {
     let subranges = range.chunk_ranges(FEEDBACK_CHUNK_SIZE as u64).collect::<Vec<_>>();
-    // let subranges = range.array_chunks::<FEEDBACK_CHUNK_SIZE>();
-
-    // let remainder = subranges.clone().into_remainder();
 
     for subrange in subranges {
         let subrange_distance = subrange.end - subrange.start;
@@ -195,23 +193,24 @@ fn do_aes_range(
     to_crack: [GenericArray16; NUMBER_OF_BYTES_TO_CHECK],
     feedback_send: mpsc::Sender<FeedbackData>,
 ) {
-    // the way this converts
+    // the way this converts is a little difficult to understand just by looking at it
+    // firstly, we take our "mask" and create an array of its bytes
+    // next, we create another "swap array" that is just the zeros in the middle of the mask
+    // for every value, we convert it into bytes using atoi, and store it in the swap buffer
+    // then, we swap the middle of the key buffer with the swap buffer
     let mut key_buffer = *b"1700000000000024";
-    let mut inner_buffer = *b"000000000000";
+    let mut swap_buffer = *b"000000000000";
     for value in range {
-        let to_crack = to_crack.clone();
         let result: Result<Vec<u8>, AesCrackError> = {
-            let mut to_crack = to_crack;
-            let _ = value.numtoa(10, &mut inner_buffer);
-            // let rang = (2 + (12 - inner_buffer.len()))..(14);
-            let rang = 2..14;
-            // key_buffer.replace_range(rang, inner);
-            key_buffer[rang].swap_with_slice(&mut inner_buffer);
-            assert_eq!(key_buffer.len(), 16, "key was not 16 bytes long");
+            let mut to_crack = to_crack.clone();
+            let chunks = to_crack.as_mut_slice();
+
+            let _ = value.numtoa(10, &mut swap_buffer);
+            let middle_of_key = 2..14;
+            key_buffer[middle_of_key].swap_with_slice(&mut swap_buffer);
 
             let cipher = aes::Aes128::new_from_slice(&mut key_buffer).expect("cipher failed");
 
-            let chunks = to_crack.as_mut_slice();
             cipher.decrypt_blocks(chunks);
 
             if chunks[0][..=HEADER_SEARCH.len()] == HEADER_SEARCH {
