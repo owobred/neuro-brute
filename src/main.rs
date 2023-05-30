@@ -20,7 +20,7 @@ use tracing_subscriber::{prelude::*, util::SubscriberInitExt};
 const THREAD_COUNT: usize = 16;
 const FEEDBACK_CHUNK_SIZE: usize = 5_000_000;
 const FEEDBACK_WAIT_MS: u64 = 10000;
-const NUMBER_OF_BYTES_TO_CHECK: usize = 4;
+const NUMBER_OF_CHUNKS_TO_CHECK: usize = 4;
 const HEADER_SEARCH: [u8; 4] = *b"\x89PNG";
 
 #[derive(Debug, Error)]
@@ -69,8 +69,8 @@ fn main() {
         })
         .collect::<Vec<_>>();
     // we're looking for a png header, which fits inside the first 16 bytes, therefore we only need to check the first byte
-    let chunks = chunks.into_iter().take(NUMBER_OF_BYTES_TO_CHECK).collect::<Vec<_>>();
-    let mut temp = [GenericArray16::from([0u8; 16]); NUMBER_OF_BYTES_TO_CHECK];
+    let chunks = chunks.into_iter().take(NUMBER_OF_CHUNKS_TO_CHECK).collect::<Vec<_>>();
+    let mut temp = [GenericArray16::from([0u8; 16]); NUMBER_OF_CHUNKS_TO_CHECK];
     for (index, posistion) in temp.iter_mut().enumerate() {
         *posistion = chunks[index].to_owned();
     }
@@ -171,7 +171,7 @@ fn main() {
 }
 
 fn handle_aes_crack(
-    to_crack: [GenericArray16; NUMBER_OF_BYTES_TO_CHECK],
+    to_crack: [GenericArray16; NUMBER_OF_CHUNKS_TO_CHECK],
     range: Range<u64>,
     counter: Arc<AtomicU64>,
     feedback_send: mpsc::Sender<FeedbackData>,
@@ -190,7 +190,7 @@ fn handle_aes_crack(
 
 fn do_aes_range(
     range: Range<u64>,
-    to_crack: [GenericArray16; NUMBER_OF_BYTES_TO_CHECK],
+    to_crack: [GenericArray16; NUMBER_OF_CHUNKS_TO_CHECK],
     feedback_send: mpsc::Sender<FeedbackData>,
 ) {
     // the way this converts is a little difficult to understand just by looking at it
