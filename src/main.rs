@@ -1,4 +1,4 @@
-#![feature(slice_as_chunks, iter_array_chunks, file_create_new)]
+#![feature(slice_as_chunks)]
 
 use std::{
     io::Write,
@@ -12,20 +12,23 @@ use std::{
 use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockDecryptMut, KeyInit};
 use base64::Engine;
 use num_format::{Locale, ToFormattedString};
+use numtoa::NumToA;
 use thiserror::Error;
 use tracing::{debug, info, warn};
-use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{prelude::*, util::SubscriberInitExt};
 
 const THREAD_COUNT: usize = 16;
-const FEEDBACK_CHUNK_SIZE: usize = 250_000;
+const FEEDBACK_CHUNK_SIZE: usize = 5_000_000;
 const FEEDBACK_WAIT_MS: u64 = 10000;
+const NUMBER_OF_CHUNKS_TO_CHECK: usize = 4;
+const HEADER_SEARCH: [u8; 4] = *b"\x89PNG";
 
 #[derive(Debug, Error)]
 enum AesCrackError {
     #[error("failed to decrypt data")]
     DecryptionError,
-    #[error("decrypted data was not utf-8")]
-    NotUtf8,
+    #[error("decrypted data had no png header")]
+    NotPng,
 }
 
 type GenericArray16 = GenericArray<u8, aes::cipher::typenum::U16>;
@@ -33,7 +36,7 @@ type GenericArray16 = GenericArray<u8, aes::cipher::typenum::U16>;
 #[derive(Debug)]
 struct FeedbackData {
     key: String,
-    data: String,
+    data: Vec<u8>,
 }
 
 fn main() {
@@ -65,11 +68,16 @@ fn main() {
                 .expect("failed to convert chunk to generic array")
         })
         .collect::<Vec<_>>();
-    // only check the first 4 chunks for speed
-    let chunks = chunks.into_iter().take(4).collect::<Vec<_>>();
+    // we're looking for a png header, which fits inside the first 16 bytes, therefore we only need to check the first byte
+    let chunks = chunks.into_iter().take(NUMBER_OF_CHUNKS_TO_CHECK).collect::<Vec<_>>();
+    let mut temp = [GenericArray16::from([0u8; 16]); NUMBER_OF_CHUNKS_TO_CHECK];
+    for (index, posistion) in temp.iter_mut().enumerate() {
+        *posistion = chunks[index].to_owned();
+    }
+    let chunks = temp;
 
     // we want to go through every number that is 16 digits long, starts with 17 and ends with 24
-    // this means we havae 10^15 - 1 numbers to go through
+    // this means we havae 10^12 - 1 numbers to go through
 
     let max_value = 10u64.pow(12);
     let single_range = max_value as f64 / THREAD_COUNT as f64;
@@ -89,16 +97,17 @@ fn main() {
 
     let mut crack_threads = vec![];
 
-    for thread_range in thread_ranges {
+    for (thread_id, thread_range) in thread_ranges.into_iter().enumerate() {
         let thread_to_crack = chunks.clone();
         let counter = counter.clone();
         let feedback_send = feedback_send.clone();
 
         let handle = std::thread::Builder::new()
-            .name("crack thread".to_string())
-            .stack_size(100 * 1024 * 1024)
+            .name(format!("crack thread {}", thread_id))
             .spawn(move || {
+                debug!("starting crack thread {}", thread_id);
                 handle_aes_crack(thread_to_crack, thread_range, counter, feedback_send);
+                debug!("crack thread {} completed", thread_id);
             }).expect("thread spawn failed");
         crack_threads.push(handle);
     }
@@ -125,10 +134,6 @@ fn main() {
             );
 
             last_count = new_count;
-
-            if new_count > 500_000_000 {
-                std::process::exit(0);
-            }
 
             if rate_should_exit.load(std::sync::atomic::Ordering::Relaxed) {
                 warn!("rate thread exiting due to feedback thread exiting");
@@ -166,57 +171,52 @@ fn main() {
 }
 
 fn handle_aes_crack(
-    to_crack: Vec<GenericArray16>,
+    to_crack: [GenericArray16; NUMBER_OF_CHUNKS_TO_CHECK],
     range: Range<u64>,
     counter: Arc<AtomicU64>,
     feedback_send: mpsc::Sender<FeedbackData>,
 ) {
-    let subranges = range.array_chunks::<FEEDBACK_CHUNK_SIZE>();
-
-    let remainder = subranges.clone().into_remainder();
+    let subranges = range.chunk_ranges(FEEDBACK_CHUNK_SIZE as u64).collect::<Vec<_>>();
 
     for subrange in subranges {
-        do_aes_range(subrange.to_vec(), to_crack.clone(), feedback_send.clone());
+        let subrange_distance = subrange.end - subrange.start;
+        do_aes_range(subrange, to_crack.clone(), feedback_send.clone());
         counter.fetch_add(
-            FEEDBACK_CHUNK_SIZE as u64,
+            subrange_distance,
             std::sync::atomic::Ordering::Relaxed,
         );
-    }
-
-    if let Some(extra) = remainder {
-        let extra = extra.collect::<Vec<_>>();
-        let extra_len = extra.len();
-        do_aes_range(extra, to_crack, feedback_send);
-        counter.fetch_add(extra_len as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 fn do_aes_range(
-    range: Vec<u64>,
-    to_crack: Vec<GenericArray16>,
+    range: Range<u64>,
+    to_crack: [GenericArray16; NUMBER_OF_CHUNKS_TO_CHECK],
     feedback_send: mpsc::Sender<FeedbackData>,
 ) {
-    let mut key_buffer = "1700000000000024".to_string();
+    // the way this converts is a little difficult to understand just by looking at it
+    // firstly, we take our "mask" and create an array of its bytes
+    // next, we create another "swap array" that is just the zeros in the middle of the mask
+    // for every value, we convert it into bytes using atoi, and store it in the swap buffer
+    // then, we swap the middle of the key buffer with the swap buffer
+    let mut key_buffer = *b"1700000000000024";
+    let mut swap_buffer = *b"000000000000";
     for value in range {
-        let to_crack = to_crack.clone();
-        let result = {
-            let mut to_crack = to_crack;
-            let inner = value.to_string();
-            let rang = (2 + (12 - inner.len()))..(14);
-            key_buffer.replace_range(rang, &inner);
-            assert_eq!(key_buffer.len(), 16, "key was not 16 bytes long");
-
-            let cipher = aes::Aes128::new_from_slice(key_buffer.as_bytes()).expect("cipher failed");
-
+        let result: Result<Vec<u8>, AesCrackError> = {
+            let mut to_crack = to_crack.clone();
             let chunks = to_crack.as_mut_slice();
+
+            let _ = value.numtoa(10, &mut swap_buffer);
+            let middle_of_key = 2..14;
+            key_buffer[middle_of_key].swap_with_slice(&mut swap_buffer);
+
+            let cipher = aes::Aes128::new_from_slice(&mut key_buffer).expect("cipher failed");
+
             cipher.decrypt_blocks(chunks);
 
-            if let Ok(utf8) = simdutf8::basic::from_utf8(
-                &chunks.into_iter().flatten().map(|v| *v).collect::<Vec<_>>(),
-            ) {
-                Ok(utf8.to_owned())
+            if chunks[0][..=HEADER_SEARCH.len()] == HEADER_SEARCH {
+                Ok(chunks.into_iter().flatten().map(|v| *v).collect::<Vec<_>>())
             } else {
-                Err(AesCrackError::NotUtf8)
+                Err(AesCrackError::NotPng)
             }
         };
 
@@ -228,13 +228,13 @@ fn do_aes_range(
                         data: string.clone(),
                     })
                     .expect(&format!(
-                        "failed to send message back. message was {}",
+                        "failed to send message back. message was {:x?}",
                         string
                     ));
             }
             Err(error) => match error {
                 AesCrackError::DecryptionError => warn!("Decryption error for value {}", value),
-                AesCrackError::NotUtf8 => (),
+                AesCrackError::NotPng => (),
             },
         };
     }
@@ -244,21 +244,47 @@ fn get_key_from_value_slow(value: u64) -> String {
     format!("17{:0>12}24", value)
 }
 
-// fn do_aes_crack(mut to_crack: Vec<GenericArray16>, value: u64) -> Result<String, AesCrackError> {
-//     let key = get_key_from_value(value);
-//     assert_eq!(key.len(), 16, "key was not 16 bytes long");
+struct ChunkRanges {
+    ranges: Vec<Range<u64>>,
+}
 
-//     let cipher =
-//         aes::Aes128::new_from_slice(key.as_bytes()).map_err(|_| AesCrackError::DecryptionError)?;
+impl ChunkRanges {
+    fn new(range: Range<u64>, chunk_size: u64) -> Self {
 
-//     let chunks = to_crack.as_mut_slice();
-//     cipher.decrypt_blocks(chunks);
+        let mut ranges = vec![];
+        let mut last_start = range.start;
+        loop {
+            let mut next_length = last_start + chunk_size;
+            if next_length > range.end {
+                next_length = range.end;
+            }
+            let new_range = last_start..next_length;
+            ranges.push(new_range);
+            if next_length >= range.end {
+                break;
+            }
+            last_start = next_length;
+        }
+        ranges.reverse();
 
-//     if let Ok(utf8) =
-//         simdutf8::basic::from_utf8(&chunks.into_iter().flatten().map(|v| *v).collect::<Vec<_>>())
-//     {
-//         Ok(utf8.to_owned())
-//     } else {
-//         Err(AesCrackError::NotUtf8)
-//     }
-// }
+        Self { ranges }
+    }
+}
+
+impl Iterator for ChunkRanges {
+    type Item = Range<u64>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.ranges.pop()
+    }
+}
+
+trait ChunkRangesExt {
+    fn chunk_ranges(&self, chunk_size: u64) -> ChunkRanges;
+}
+
+impl ChunkRangesExt for Range<u64> {
+    fn chunk_ranges(&self, chunk_size: u64) -> ChunkRanges {
+        ChunkRanges::new(self.clone(), chunk_size)
+    }
+}
