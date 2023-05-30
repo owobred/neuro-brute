@@ -68,6 +68,7 @@ fn main() {
         .collect::<Vec<_>>();
     // only check the first 4 chunks for speed
     let chunks = chunks.into_iter().take(4).collect::<Vec<_>>();
+    let chunks = [chunks[0], chunks[1], chunks[2], chunks[3]];
 
     // we want to go through every number that is 16 digits long, starts with 17 and ends with 24
     // this means we havae 10^15 - 1 numbers to go through
@@ -167,7 +168,7 @@ fn main() {
 }
 
 fn handle_aes_crack(
-    to_crack: Vec<GenericArray16>,
+    to_crack: [GenericArray16; 4],
     range: Range<u64>,
     counter: Arc<AtomicU64>,
     feedback_send: mpsc::Sender<FeedbackData>,
@@ -194,7 +195,7 @@ fn handle_aes_crack(
 
 fn do_aes_range(
     range: Vec<u64>,
-    to_crack: Vec<GenericArray16>,
+    mut to_crack: [GenericArray16; 4],
     feedback_send: mpsc::Sender<FeedbackData>,
 ) {
     let mut key_buffer = [0x31, 0x37, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x32, 0x34];
