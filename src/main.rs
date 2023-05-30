@@ -15,7 +15,7 @@ use num_format::{Locale, ToFormattedString};
 use numtoa::NumToA;
 use thiserror::Error;
 use tracing::{debug, info, warn};
-use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{prelude::*, util::SubscriberInitExt};
 
 const THREAD_COUNT: usize = 16;
 const FEEDBACK_CHUNK_SIZE: usize = 5_000_000;
@@ -71,7 +71,7 @@ fn main() {
     let chunks = [chunks[0], chunks[1], chunks[2], chunks[3]];
 
     // we want to go through every number that is 16 digits long, starts with 17 and ends with 24
-    // this means we havae 10^15 - 1 numbers to go through
+    // this means we havae 10^12 - 1 numbers to go through
 
     let max_value = 10u64.pow(12);
     let single_range = max_value as f64 / THREAD_COUNT as f64;
@@ -246,22 +246,3 @@ fn do_aes_range(
 fn get_key_from_value_slow(value: u64) -> String {
     format!("17{:0>12}24", value)
 }
-
-// fn do_aes_crack(mut to_crack: Vec<GenericArray16>, value: u64) -> Result<String, AesCrackError> {
-//     let key = get_key_from_value(value);
-//     assert_eq!(key.len(), 16, "key was not 16 bytes long");
-
-//     let cipher =
-//         aes::Aes128::new_from_slice(key.as_bytes()).map_err(|_| AesCrackError::DecryptionError)?;
-
-//     let chunks = to_crack.as_mut_slice();
-//     cipher.decrypt_blocks(chunks);
-
-//     if let Ok(utf8) =
-//         simdutf8::basic::from_utf8(&chunks.into_iter().flatten().map(|v| *v).collect::<Vec<_>>())
-//     {
-//         Ok(utf8.to_owned())
-//     } else {
-//         Err(AesCrackError::NotUtf8)
-//     }
-// }
