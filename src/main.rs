@@ -11,7 +11,7 @@ use neuro_brute::{
 };
 
 use num_format::{Locale, ToFormattedString};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, trace};
 use tracing_subscriber::prelude::*;
 
 const RATE_CHUNK_SIZE: u64 = 100_000;
@@ -93,6 +93,7 @@ fn subrange_thread(
                 }
             },
         );
+        trace!("completed subrange {:?}", subrange);
         count.fetch_add(subrange_size, std::sync::atomic::Ordering::Relaxed);
     }
 }
