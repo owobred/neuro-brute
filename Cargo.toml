@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 aes = "0.8.2"
 base64 = "0.21.2"
+cbc = "0.1.2"
 num-format = "0.4.4"
 numtoa = "0.2.4"
 simdutf8 = "0.1.4"

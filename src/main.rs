@@ -1,48 +1,25 @@
-#![feature(slice_as_chunks)]
+#![feature(array_chunks)]
 
 use std::{
-    io::Write,
     ops::Range,
-    sync::{
-        atomic::{AtomicBool, AtomicU64},
-        mpsc, Arc,
-    },
+    sync::{atomic::AtomicU64, Arc},
 };
 
-use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockDecryptMut, KeyInit};
-use base64::Engine;
+use neuro_brute::{
+    brute::attempt_range_aes_with_iv,
+    util::{decode_base64, ChunkRangesExt, DivideUpRangeExt},
+};
+
 use num_format::{Locale, ToFormattedString};
-use numtoa::NumToA;
-use thiserror::Error;
 use tracing::{debug, info, warn};
-use tracing_subscriber::{prelude::*, util::SubscriberInitExt};
+use tracing_subscriber::prelude::*;
 
-const THREAD_COUNT: usize = 16;
-const FEEDBACK_CHUNK_SIZE: usize = 5_000_000;
-const FEEDBACK_WAIT_MS: u64 = 10000;
-const NUMBER_OF_CHUNKS_TO_CHECK: usize = 4;
-const HEADER_SEARCH: [u8; 4] = *b"\x89PNG";
-
-#[derive(Debug, Error)]
-enum AesCrackError {
-    #[error("failed to decrypt data")]
-    DecryptionError,
-    #[error("decrypted data had no png header")]
-    NotPng,
-}
-
-type GenericArray16 = GenericArray<u8, aes::cipher::typenum::U16>;
-
-#[derive(Debug)]
-struct FeedbackData {
-    key: String,
-    data: Vec<u8>,
-}
+const RATE_CHUNK_SIZE: u64 = 100_000;
+const RATE_WAIT_MS: u64 = 10_000;
 
 fn main() {
-    // setup tracing
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info,neuro-brute=debug");
+        std::env::set_var("RUST_LOG", "info,neuro_brute=debug");
     }
 
     tracing_subscriber::registry()
@@ -50,241 +27,102 @@ fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    debug!("parsing base64 data");
-    let b64 = include_str!("base64.txt");
-    let engine = base64::engine::general_purpose::STANDARD;
-    let data = engine.decode(b64).expect("failed to decode base64");
-    assert_eq!(data.len(), 1040, "decoded base64 was not 1040 bytes long");
-    let (chunks, extra) = data.as_chunks::<16>();
-    assert!(
-        extra.is_empty(),
-        "decoded data did not fit evenly into 16 byte chunks"
-    );
-    let chunks = chunks.to_owned();
-    let chunks: Vec<GenericArray16> = chunks
-        .into_iter()
-        .map(|chunk| {
-            GenericArray::from_exact_iter(chunk.to_owned())
-                .expect("failed to convert chunk to generic array")
-        })
-        .collect::<Vec<_>>();
-    // we're looking for a png header, which fits inside the first 16 bytes, therefore we only need to check the first byte
-    let chunks = chunks.into_iter().take(NUMBER_OF_CHUNKS_TO_CHECK).collect::<Vec<_>>();
-    let mut temp = [GenericArray16::from([0u8; 16]); NUMBER_OF_CHUNKS_TO_CHECK];
-    for (index, posistion) in temp.iter_mut().enumerate() {
-        *posistion = chunks[index].to_owned();
-    }
-    let chunks = temp;
+    let thread_count = std::thread::available_parallelism().unwrap().get();
 
-    // we want to go through every number that is 16 digits long, starts with 17 and ends with 24
-    // this means we havae 10^12 - 1 numbers to go through
+    let range = 0..10u64.pow(12);
+    let data = decode_base64(include_str!("base64.txt"));
+    let data = data.try_into().expect("data had incorrect length");
 
-    let max_value = 10u64.pow(12);
-    let single_range = max_value as f64 / THREAD_COUNT as f64;
+    let key = *b"1700000000000024";
 
-    let mut thread_ranges = Vec::with_capacity(THREAD_COUNT);
+    let iv = decode_base64("DQ5zl4ighWwiag7y+cWFQg==")
+        .as_slice()
+        .try_into()
+        .expect("iv was incorrect size");
 
-    for thread in 0..THREAD_COUNT {
-        let thread_range =
-            ((thread as f64 * single_range) as u64)..(((thread + 1) as f64 * single_range) as u64);
-        thread_ranges.push(thread_range);
-    }
+    let count = Arc::new(AtomicU64::new(0));
 
-    println!("ranges: {:?}", thread_ranges);
-    let counter = Arc::new(AtomicU64::new(0));
-    let completed = Arc::new(AtomicBool::new(false));
-    let (feedback_send, feedback_rcv) = mpsc::channel::<FeedbackData>();
+    let mut threads = vec![];
 
-    let mut crack_threads = vec![];
+    let max_value = range.end;
+    let rate_count = count.clone();
+    let rate_thread = std::thread::spawn(move || {
+        rate_thread(max_value, rate_count);
+    });
+    threads.push(rate_thread);
 
-    for (thread_id, thread_range) in thread_ranges.into_iter().enumerate() {
-        let thread_to_crack = chunks.clone();
-        let counter = counter.clone();
-        let feedback_send = feedback_send.clone();
-
-        let handle = std::thread::Builder::new()
+    for (thread_id, subrange) in range.divide_up(thread_count).enumerate() {
+        let count = count.clone();
+        let thread = std::thread::Builder::new()
             .name(format!("crack thread {}", thread_id))
             .spawn(move || {
                 debug!("starting crack thread {}", thread_id);
-                handle_aes_crack(thread_to_crack, thread_range, counter, feedback_send);
+                subrange_thread(subrange, data, key, iv, count);
                 debug!("crack thread {} completed", thread_id);
-            }).expect("thread spawn failed");
-        crack_threads.push(handle);
+            })
+            .expect("failed to spawn crack thread");
+        threads.push(thread);
     }
-    drop(feedback_send); // drop the extra sender
-
-    let rate_should_exit = completed.clone();
-    let rate_thread = std::thread::spawn(move || {
-        let mut last_count = 0;
-        loop {
-            let new_count = counter.load(std::sync::atomic::Ordering::Relaxed);
-            assert!(
-                new_count >= last_count,
-                "new count was less than last count"
-            );
-            let delta = new_count - last_count;
-            let rate = delta as f64 / (FEEDBACK_WAIT_MS as f64 / 1000.0);
-
-            info!(
-                "{}/{} ({:.3}%) current rate {} keys/second",
-                new_count.to_formatted_string(&Locale::en),
-                max_value.to_formatted_string(&Locale::en),
-                (new_count as f64 / max_value as f64) * 100.0,
-                (rate as u64).to_formatted_string(&Locale::en)
-            );
-
-            last_count = new_count;
-
-            if rate_should_exit.load(std::sync::atomic::Ordering::Relaxed) {
-                warn!("rate thread exiting due to feedback thread exiting");
-                break;
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(FEEDBACK_WAIT_MS));
-        }
-    });
-
-    let feedback_thread = std::thread::spawn(move || {
-        let mut file =
-            std::fs::File::create("./crack_keys.txt").expect("failed to create crack_keys.txt");
-        for feedback in feedback_rcv {
-            info!("got feedback: {:?}", feedback);
-            let to_write = format!("{:?}\n", feedback);
-            file.write(to_write.as_bytes())
-                .expect("failed to write key to file");
-            file.flush().expect("failed to flush file");
-        }
-        completed.store(true, std::sync::atomic::Ordering::Relaxed);
-        warn!("feedback thread exited")
-    });
-
-    let mut threads = vec![];
-    threads.push(feedback_thread);
-    threads.push(rate_thread);
-    threads.extend(crack_threads);
 
     for thread in threads {
-        thread.join().expect("thread panicked");
+        thread.join().expect("failed to join thread");
     }
 
-    info!("completed");
+    info!("done")
 }
 
-fn handle_aes_crack(
-    to_crack: [GenericArray16; NUMBER_OF_CHUNKS_TO_CHECK],
+fn subrange_thread(
     range: Range<u64>,
-    counter: Arc<AtomicU64>,
-    feedback_send: mpsc::Sender<FeedbackData>,
+    data: [u8; 1040],
+    key: [u8; 16],
+    iv: [u8; 16],
+    count: Arc<AtomicU64>,
 ) {
-    let subranges = range.chunk_ranges(FEEDBACK_CHUNK_SIZE as u64).collect::<Vec<_>>();
-
-    for subrange in subranges {
-        let subrange_distance = subrange.end - subrange.start;
-        do_aes_range(subrange, to_crack.clone(), feedback_send.clone());
-        counter.fetch_add(
-            subrange_distance,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-}
-
-fn do_aes_range(
-    range: Range<u64>,
-    to_crack: [GenericArray16; NUMBER_OF_CHUNKS_TO_CHECK],
-    feedback_send: mpsc::Sender<FeedbackData>,
-) {
-    // the way this converts is a little difficult to understand just by looking at it
-    // firstly, we take our "mask" and create an array of its bytes
-    // next, we create another "swap array" that is just the zeros in the middle of the mask
-    // for every value, we convert it into bytes using atoi, and store it in the swap buffer
-    // then, we swap the middle of the key buffer with the swap buffer
-    let mut key_buffer = *b"1700000000000024";
-    let mut swap_buffer = *b"000000000000";
-    for value in range {
-        let result: Result<Vec<u8>, AesCrackError> = {
-            let mut to_crack = to_crack.clone();
-            let chunks = to_crack.as_mut_slice();
-
-            let _ = value.numtoa(10, &mut swap_buffer);
-            let middle_of_key = 2..14;
-            key_buffer[middle_of_key].swap_with_slice(&mut swap_buffer);
-
-            let cipher = aes::Aes128::new_from_slice(&mut key_buffer).expect("cipher failed");
-
-            cipher.decrypt_blocks(chunks);
-
-            if chunks[0][..=HEADER_SEARCH.len()] == HEADER_SEARCH {
-                Ok(chunks.into_iter().flatten().map(|v| *v).collect::<Vec<_>>())
-            } else {
-                Err(AesCrackError::NotPng)
-            }
-        };
-
-        match result {
-            Ok(string) => {
-                feedback_send
-                    .send(FeedbackData {
-                        key: get_key_from_value_slow(value),
-                        data: string.clone(),
-                    })
-                    .expect(&format!(
-                        "failed to send message back. message was {:x?}",
-                        string
-                    ));
-            }
-            Err(error) => match error {
-                AesCrackError::DecryptionError => warn!("Decryption error for value {}", value),
-                AesCrackError::NotPng => (),
+    for subrange in range.chunk_ranges(RATE_CHUNK_SIZE) {
+        let subrange_size = subrange.end - subrange.start;
+        attempt_range_aes_with_iv::<1040, 2, 12, b'0'>(
+            subrange.clone(),
+            data,
+            key,
+            iv,
+            |value, decrypted| {
+                if let Ok(decrypted) = decrypted {
+                    if let Ok(utf) = simdutf8::basic::from_utf8(decrypted) {
+                        info!("key {} had value {}", String::from_utf8_lossy(&value), utf,);
+                    }
+                }
             },
-        };
+        );
+        count.fetch_add(subrange_size, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-fn get_key_from_value_slow(value: u64) -> String {
-    format!("17{:0>12}24", value)
-}
+fn rate_thread(max_value: u64, count: Arc<AtomicU64>) {
+    let mut last_count = 0;
+    loop {
+        let new_count = count.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            new_count >= last_count,
+            "new count was less than last count"
+        );
+        let delta = new_count - last_count;
+        let rate = delta as f64 / (RATE_WAIT_MS as f64 / 1000.0);
 
-struct ChunkRanges {
-    ranges: Vec<Range<u64>>,
-}
+        info!(
+            "{}/{} ({:.3}%) current rate {} keys/second",
+            new_count.to_formatted_string(&Locale::en),
+            max_value.to_formatted_string(&Locale::en),
+            (new_count as f64 / max_value as f64) * 100.0,
+            (rate as u64).to_formatted_string(&Locale::en)
+        );
 
-impl ChunkRanges {
-    fn new(range: Range<u64>, chunk_size: u64) -> Self {
+        last_count = new_count;
 
-        let mut ranges = vec![];
-        let mut last_start = range.start;
-        loop {
-            let mut next_length = last_start + chunk_size;
-            if next_length > range.end {
-                next_length = range.end;
-            }
-            let new_range = last_start..next_length;
-            ranges.push(new_range);
-            if next_length >= range.end {
-                break;
-            }
-            last_start = next_length;
+        if new_count == max_value {
+            break;
         }
-        ranges.reverse();
 
-        Self { ranges }
+        std::thread::sleep(std::time::Duration::from_millis(RATE_WAIT_MS));
     }
-}
-
-impl Iterator for ChunkRanges {
-    type Item = Range<u64>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.ranges.pop()
-    }
-}
-
-trait ChunkRangesExt {
-    fn chunk_ranges(&self, chunk_size: u64) -> ChunkRanges;
-}
-
-impl ChunkRangesExt for Range<u64> {
-    fn chunk_ranges(&self, chunk_size: u64) -> ChunkRanges {
-        ChunkRanges::new(self.clone(), chunk_size)
-    }
+    warn!("rate thread completed")
 }
